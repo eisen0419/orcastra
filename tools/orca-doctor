@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""Read-only health check for a local Orca installation.
+
+Runs four general checks and reports OK / WARN / FAIL / SKIP per check:
+  1. app version   - read the installed app's version + whether `orca` is on PATH
+  2. CLI attribution - which binary bare `orca` resolves to on PATH (stray = FAIL)
+  3. runtime handshake - runtime json + live unix-socket probe (fake-green = FAIL)
+  4. data integrity   - active-profile data file + rolling backups
+
+Exit codes: 0 = all OK/SKIP, 1 = WARN present, 2 = FAIL present, 64 = usage error.
+
+Zero third-party dependencies (standard library only). Never writes to anything
+it inspects. Path layout assumptions are stamped with the Orca version they were
+verified against; override every path with flags when needed.
+
+Path layout verified against Orca 1.4.176 (2026-08-09).
+"""
+
+import argparse
+import json
+import os
+import plistlib
+import re
+import socket
+import stat
+import sys
+from pathlib import Path
+from xml.parsers import expat
+
+
+# --- status vocabulary ------------------------------------------------------
+
+STATUS_ORDER = ("OK", "WARN", "FAIL", "SKIP")
+APP_VERSION_KEY = "CFBundleShortVersionString"
+
+# --- on-disk layout (verified: Orca 1.4.176, 2026-08-09) --------------------
+# All landing points are overridable via flags; these are the canonical defaults
+# for a standard macOS install of Orca.
+
+DATA_FILE_NAME = "orca-data.json"
+PROFILES_DIR_NAME = "profiles"
+PROFILE_INDEX_FILE_NAME = "orca-profile-index.json"
+RUNTIME_FILE_NAME = "orca-runtime.json"
+BACKUP_SUFFIXES = tuple(f".bak.{i}" for i in range(5))
+SOCKET_TIMEOUT_SECONDS = 3
+
+# Mirrors the profile-id validity rule Orca itself enforces (isProfileSummary;
+# verified against Orca 1.4.176, 2026-08-09).
+# The purpose is path safety: profile IDs read from the on-disk index become
+# filesystem path segments, so a tampered index must not be able to escape the
+# profiles directory. This single regex is therefore both the validity gate and
+# the path-traversal defense.
+PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+USAGE_EXIT_CODE = 64
+
+
+def add_check(checks, name, status, detail):
+    checks.append({"name": name, "status": status, "detail": detail})
+
+
+# --- filesystem probe (six-state, never folds uncertainty into "absent") ----
+
+def probe_path(path):
+    """Probe a path into one of six states: file / dir / absent / broken-link /
+    special / unknown.
+
+    Path.is_file()/is_dir() fold OSError into False, disguising "probe
+    uncertain" as "absent". Since "absent" is the one branch allowed to fall
+    back to a legacy root file, a probe failure becomes a false-green. Broken
+    symlinks and FIFO/socket/device nodes are listed separately and must NOT be
+    merged into "absent" either - both can otherwise make an index look absent
+    and trigger an OK-on-stale-root. ValueError is caught because os.stat raises
+    it on paths containing NUL or unpaired surrogates.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, ValueError):
+        return "unknown"
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return "broken-link"
+        except (OSError, ValueError):
+            return "unknown"
+    if stat.S_ISREG(st.st_mode):
+        return "file"
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    return "special"
+
+
+def _resolve_safely(path):
+    """Path.resolve() with bounded catching; returns (resolved_or_None, error).
+
+    Never bubbles - a whole-doctor traceback with empty stdout is an established
+    anti-pattern. Covers OSError / ValueError (NUL, unpaired surrogate) /
+    RuntimeError (unknown user form like ~nobody).
+    """
+    try:
+        return Path(path).resolve(), None
+    except (OSError, ValueError, RuntimeError) as error:
+        return None, error
+
+
+# --- CLI candidate discovery (shared by versions + attribution) -------------
+
+def find_orca_candidates(path_env):
+    """Walk PATH segments and return [(orig, resolved_or_None, reason_or_None)].
+
+    Segment dedup is by string identity (not realpath): two different
+    directories that point at the same place is a normal setup, and we only
+    suppress the same string repeated (some shells duplicate ~/.local/bin).
+    Empty segments are skipped - a diagnostic tool must not treat cwd as a CLI
+    source, unlike shutil.which's POSIX behavior. Exceptions from resolve never
+    bubble (see _resolve_safely).
+    """
+    search_path = path_env if path_env is not None else os.environ.get("PATH", "")
+    seen = set()
+    candidates = []
+    for segment in search_path.split(os.pathsep):
+        if not segment:
+            continue
+        if segment in seen:
+            continue
+        seen.add(segment)
+        candidate = os.path.join(segment, "orca")
+        state = probe_path(candidate)
+        if state == "file":
+            resolved, error = _resolve_safely(candidate)
+            reason = str(error) if error is not None else None
+            candidates.append((candidate, resolved, reason))
+        elif state == "broken-link":
+            # A broken-link candidate exists but its target is unreachable. It
+            # must not be merged into "absent" - "orca is on PATH but broken"
+            # is a different signal from "no orca on PATH".
+            candidates.append((candidate, None, "broken link"))
+        # absent / dir / special / unknown are not candidates
+    return candidates
+
+
+# --- check 1: app version + CLI reachability --------------------------------
+
+VERSIONS_CHECK_NAME = "app version"
+
+
+def check_versions(args, checks):
+    """Report the installed Orca app version and whether `orca` is on PATH.
+
+    This deliberately does NOT compare against a source checkout. The version is
+    informational: the user cross-checks it against docs/compat.md. By design,
+    version issues are soft (WARN/SKIP), never FAIL - "no matrix match" is a
+    WARN, not a FAIL.
+    """
+    plist_path = Path(args.app_plist).expanduser()
+    state = probe_path(plist_path)
+    if state == "absent":
+        add_check(checks, VERSIONS_CHECK_NAME, "SKIP",
+                  f"Orca app not found at {plist_path}; is Orca installed?")
+        return
+    if state != "file":
+        add_check(checks, VERSIONS_CHECK_NAME, "WARN",
+                  f"Info.plist is not a regular file (probe={state}): {plist_path}")
+        return
+    try:
+        with plist_path.open("rb") as handle:
+            app_version = plistlib.load(handle)[APP_VERSION_KEY]
+    except (KeyError, TypeError, OSError, ValueError, expat.ExpatError,
+            plistlib.InvalidFileException) as error:
+        add_check(checks, VERSIONS_CHECK_NAME, "WARN",
+                  f"could not parse Info.plist: {error}")
+        return
+
+    candidates = find_orca_candidates(args.path_env)
+    if candidates:
+        first_orig, first_resolved, _reason = candidates[0]
+        real = str(first_resolved) if first_resolved is not None else first_orig
+        add_check(checks, VERSIONS_CHECK_NAME, "OK",
+                  f"Orca {app_version}; orca CLI reachable at {real}")
+    else:
+        add_check(checks, VERSIONS_CHECK_NAME, "WARN",
+                  f"Orca {app_version}; orca CLI NOT found on PATH "
+                  "(see CLI attribution check)")
+
+
+# --- check 2: CLI attribution -----------------------------------------------
+
+CLI_CHECK_NAME = "CLI attribution"
+
+
+def check_cli(args, checks):
+    """Determine which binary bare `orca` resolves to on PATH and classify it.
+
+    The historical danger (Orca issue #8608) is a stray `orca` binary shadowing
+    the app-bundled CLI, causing CLI calls to connect to the wrong runtime.
+    Earlier Orca versions also shipped an SSH-relay CLI endpoint; retired — the
+    app CLI is the only known-good endpoint (verified: Orca 1.4.176, 2026-08-09).
+    Any other resolvable binary winning PATH is a stray shadow and a FAIL. An
+    unresolvable first candidate (broken link, resolve error) is a WARN - we
+    cannot confirm it is the app CLI, but neither can we confirm it is a stray.
+    """
+    app_resolved, _app_error = _resolve_safely(args.app_cli)
+    candidates = find_orca_candidates(args.path_env)
+
+    if not candidates:
+        add_check(checks, CLI_CHECK_NAME, "WARN",
+                  "no `orca` candidate found on PATH")
+        return
+
+    first_orig, first_resolved, first_reason = candidates[0]
+
+    if first_reason is not None or first_resolved is None:
+        status, label = "WARN", "unresolvable"
+    elif app_resolved is None:
+        # App endpoint itself unresolvable: we can neither confirm nor rule out
+        # a stray. Fail-closed soft.
+        status, label = "WARN", "unknown (app endpoint unresolvable)"
+    elif first_resolved == app_resolved:
+        status, label = "OK", "app"
+    else:
+        status, label = "FAIL", "stray"
+
+    first_real = str(first_resolved) if first_resolved is not None else f"<{first_reason}>"
+    detail = (f"first candidate {first_orig} -> {first_real} ({label}); "
+              f"{len(candidates)} candidate(s)")
+    if len(candidates) > 1:
+        lines = [detail + ":"]
+        for orig, resolved, reason in candidates:
+            real = str(resolved) if resolved is not None else f"<{reason}>"
+            lines.append(f"  {orig} -> {real}")
+        detail = "\n".join(lines)
+    add_check(checks, CLI_CHECK_NAME, status, detail)
+
+
+# --- check 3: runtime handshake (fake-green detection) ----------------------
+
+def unix_socket_endpoint(runtime):
+    if not isinstance(runtime, dict):
+        return None
+    transports = runtime.get("transports")
+    if not isinstance(transports, list):
+        return None
+    for transport in transports:
+        if isinstance(transport, dict) and transport.get("kind") == "unix":
+            endpoint = transport.get("endpoint")
+            if isinstance(endpoint, str):
+                return endpoint
+    return None
+
+
+RUNTIME_CHECK_NAME = "runtime handshake"
+
+
+def check_runtime(args, checks):
+    """Probe the runtime handshake file and actually connect to its socket.
+
+    The core value of this check is fake-green detection: a runtime json left
+    behind by a crashed/stopped app must report FAIL, not OK. A file present but
+    socket dead (connect refused/timeout) is a FAIL; a missing file or socket is
+    only a WARN (app probably not running, which is not a fault).
+    """
+    runtime_path = Path(args.data_dir).expanduser() / RUNTIME_FILE_NAME
+    if not runtime_path.is_file():
+        add_check(checks, RUNTIME_CHECK_NAME, "WARN",
+                  "runtime file absent; Orca app may not be running")
+        return
+
+    try:
+        with runtime_path.open(encoding="utf-8") as handle:
+            endpoint = unix_socket_endpoint(json.load(handle))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        add_check(checks, RUNTIME_CHECK_NAME, "WARN",
+                  f"runtime file unparseable: {error}")
+        return
+
+    if not endpoint:
+        add_check(checks, RUNTIME_CHECK_NAME, "WARN",
+                  "no unix socket endpoint in runtime file; Orca may not be running")
+        return
+
+    socket_path = Path(endpoint)
+    if not socket_path.exists():
+        add_check(checks, RUNTIME_CHECK_NAME, "WARN",
+                  f"socket does not exist: {socket_path}; Orca may not be running")
+        return
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(SOCKET_TIMEOUT_SECONDS)
+            client.connect(endpoint)
+    except OSError as error:
+        # Fake-green: file present, socket present, but runtime unresponsive.
+        add_check(checks, RUNTIME_CHECK_NAME, "FAIL",
+                  f"socket present but runtime unresponsive: {error}")
+        return
+
+    add_check(checks, RUNTIME_CHECK_NAME, "OK",
+              f"socket connected: {socket_path}")
+
+
+# --- check 4: data integrity ------------------------------------------------
+
+def worktree_counts(worktrees):
+    entries = worktrees.values()
+    total = sum(1 for e in entries if isinstance(e, dict))
+    archived = sum(1 for e in entries if isinstance(e, dict) and e.get("isArchived") is True)
+    return total, archived
+
+
+def data_schema_error(data):
+    if not isinstance(data, dict):
+        return "root is not an object"
+    if not isinstance(data.get("repos"), list):
+        return "repos is not an array"
+    if not isinstance(data.get("worktreeMeta"), dict):
+        return "worktreeMeta is not an object"
+    return None
+
+
+def reject_json_constant(name):
+    """json.load parse_constant hook: reject NaN/Infinity outright.
+
+    Upstream reads the index via JSON.parse, which rejects these non-standard
+    literals with SyntaxError. Python accepts them by default, so an index that
+    upstream cannot even load would look valid here.
+    """
+    raise ValueError(f"non-standard JSON constant {name} (rejected by upstream JSON.parse)")
+
+
+def profile_summary_is_valid(entry):
+    """Reproduce the hard constraints Orca's own profile-record check enforces
+    (isProfileSummary; verified against Orca 1.4.176, 2026-08-09).
+
+    Only the "what counts as a valid profile record" rule is reproduced. Orca
+    itself also falls back to the first profile and restores from .bak when
+    activeProfileId misses - that is product behavior a diagnostic tool must NOT
+    imitate: imitating is guessing, and a wrong guess is another false-green.
+    """
+    if not isinstance(entry, dict):
+        return False
+    profile_id = entry.get("id")
+    # fullmatch, not match: Python's `$` allows stopping before a trailing
+    # newline, so "valid\n" would pass while upstream's same regex rejects it.
+    if not isinstance(profile_id, str) or not PROFILE_ID_RE.fullmatch(profile_id):
+        return False
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    if entry.get("kind") not in ("local", "cloud-linked"):
+        return False
+    for key in ("createdAt", "updatedAt", "lastOpenedAt"):
+        value = entry.get(key)
+        # bool is a subclass of int, but JS typeof true is 'boolean' not 'number'
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+    avatar = entry.get("avatar")
+    if not isinstance(avatar, dict):
+        return False
+    if avatar.get("kind") != "initials" or not isinstance(avatar.get("initials"), str):
+        return False
+    if avatar.get("color") != "neutral":
+        return False
+    # JS: cloud === undefined || isObject(cloud); explicit null is invalid upstream
+    if "cloud" in entry and not isinstance(entry["cloud"], dict):
+        return False
+    return True
+
+
+def resolve_data_file(data_dir):
+    """Locate the active data file; return (path, layout, problem).
+
+    Authoritative source = <data-dir>/orca-profile-index.json's activeProfileId.
+    Upstream itself selects this way: ensureActiveOrcaProfile reads
+    index.activeProfileId, dataFile = profiles/<id>/orca-data.json.
+
+    Do NOT use a "count directories under profiles/" heuristic - upstream
+    creates local-<UUID> / cloud-<UUID> profiles, so count and naming are not
+    reliable signals, and when the active profile has no data file but an
+    inactive one does, counting picks the inactive one and reports OK.
+
+    The root-level same-named file is pre-migration legacy and is ONLY used when
+    the index is genuinely absent. Any other probe result (broken link, special
+    file, permission failure) must NOT fall back - falling back replays the exact
+    false-green this function exists to fix.
+
+    activeProfileId must hit a record that passes profile_summary_is_valid,
+    otherwise WARN; upstream's own fallback is deliberately not imitated.
+    """
+    root = Path(data_dir).expanduser()
+    index_path = root / PROFILE_INDEX_FILE_NAME
+    index_state = probe_path(index_path)
+
+    if index_state == "absent":
+        return root / DATA_FILE_NAME, "root layout (no profile index)", None
+    if index_state != "file":
+        return None, None, (
+            f"{PROFILE_INDEX_FILE_NAME} probe abnormal ({index_state}); "
+            "refusing to fall back to legacy root file"
+        )
+
+    try:
+        with index_path.open(encoding="utf-8") as handle:
+            # parse_constant rejects NaN/Infinity/-Infinity: Python's json accepts
+            # them, upstream's JSON.parse rejects - not rejecting would treat an
+            # index upstream cannot load as valid.
+            index = json.load(handle, parse_constant=reject_json_constant)
+    except (ValueError, OSError) as error:
+        # ValueError covers JSONDecodeError / UnicodeDecodeError / overlong
+        # integers (3.11+ 4300-digit limit) / parse_constant rejections.
+        return None, None, (
+            f"{PROFILE_INDEX_FILE_NAME} unreadable ({error}); "
+            "refusing to fall back to legacy root file"
+        )
+
+    if not isinstance(index, dict) or not isinstance(index.get("profiles"), list):
+        return None, None, (
+            f"{PROFILE_INDEX_FILE_NAME} shape wrong (root must be an object with a "
+            "profiles array); cannot determine active profile"
+        )
+
+    valid_ids = [e["id"] for e in index["profiles"] if profile_summary_is_valid(e)]
+    active = index.get("activeProfileId")
+    # Regex gate before path joining: it simultaneously blocks path traversal,
+    # NUL, unpaired surrogates, overlong and whitespace - so the later os.stat
+    # never sees a path that would raise ValueError.
+    if not isinstance(active, str) or active not in valid_ids:
+        return None, None, (
+            f"activeProfileId={active!r} does not match any valid profile record "
+            f"({len(valid_ids)} valid record(s)); upstream would fall back, "
+            "diagnostic does not guess"
+        )
+
+    candidate = root / PROFILES_DIR_NAME / active / DATA_FILE_NAME
+    candidate_state = probe_path(candidate)
+    if candidate_state == "file":
+        return candidate, f"{PROFILES_DIR_NAME}/{active}", None
+    if candidate_state == "absent":
+        return None, None, f"active profile {active} has no data file: {candidate}"
+    return None, None, (
+        f"active profile {active} data file probe abnormal ({candidate_state}); "
+        "refusing to fall back to legacy root file"
+    )
+
+
+DATA_CHECK_NAME = "data integrity"
+
+
+def check_data(args, checks):
+    data_path, layout, problem = resolve_data_file(args.data_dir)
+    if data_path is None:
+        add_check(checks, DATA_CHECK_NAME, "WARN", problem)
+        return
+
+    # Use probe_path, not is_file(): the latter folds probe failure into a silent
+    # 0, giving a falsely confident undercount. Backup count does not affect
+    # which file is chosen, but the reported number must be real.
+    backup_states = [probe_path(Path(f"{data_path}{s}")) for s in BACKUP_SUFFIXES]
+    backup_count = sum(s == "file" for s in backup_states)
+    backup_unprobeable = sum(s == "unknown" for s in backup_states)
+    backup_uncertainty = (
+        f" (another {backup_unprobeable} backup(s) unprobeable; real count may be higher)"
+        if backup_unprobeable else ""
+    )
+
+    # Every fault exit must carry the backup info, and only here is it assembled.
+    # When the main data is broken is exactly when "how many backups can roll
+    # back" matters most, so every fault exit carries the backup count.
+    def emit_fault(status, core):
+        add_check(checks, DATA_CHECK_NAME, status,
+                  f"{core}; {backup_count} .bak backup(s) available for rollback"
+                  f"{backup_uncertainty}")
+
+    if not data_path.is_file():
+        emit_fault("WARN", f"file absent: {data_path}")
+        return
+
+    try:
+        with data_path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (ValueError, UnicodeDecodeError) as error:
+        emit_fault("FAIL", f"unparseable: {error}")
+        return
+    except OSError as error:
+        emit_fault("WARN", f"unreadable: {error}")
+        return
+
+    schema_error = data_schema_error(data)
+    if schema_error:
+        emit_fault("FAIL", f"schema mismatch: {schema_error}")
+        return
+
+    repo_count = len(data["repos"])
+    worktree_count, archived_count = worktree_counts(data["worktreeMeta"])
+    add_check(checks, DATA_CHECK_NAME, "OK",
+              f"repos {repo_count}, worktrees {worktree_count} "
+              f"(archived {archived_count}), {backup_count} backup(s){backup_uncertainty} "
+              f"@ {layout}")
+
+
+# --- arg parsing + output ---------------------------------------------------
+
+class DoctorArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(USAGE_EXIT_CODE, f"{self.prog}: error: {message}\n")
+
+
+# Single source of truth for path args: the parser and the normalization step
+# both derive from this table. Adding a path arg here keeps parser and
+# expanduser handling in sync - a parallel hand-maintained list drifts (a missed
+# arg means ~ goes unexpanded and a silent empty result).
+PATH_ARG_SPECS = (
+    # (flag, default_of(home), help)
+    ("--app-plist",
+     lambda h: "/Applications/Orca.app/Contents/Info.plist",
+     "app Info.plist for version read"),
+    ("--data-dir",
+     lambda h: str(h / "Library/Application Support/Orca"),
+     "Orca data directory (runtime.json, profile index, profiles/)"),
+    ("--app-cli",
+     lambda h: "/Applications/Orca.app/Contents/Resources/bin/orca",
+     "app-bundled CLI endpoint (CLI attribution compares against this)"),
+)
+PATH_ARG_NAMES = tuple(flag[2:].replace("-", "_") for flag, _, _ in PATH_ARG_SPECS)
+
+
+def parse_args():
+    home = Path.home()
+    parser = DoctorArgumentParser(
+        description="Read-only health check for a local Orca installation.")
+    for flag, default_of, help_text in PATH_ARG_SPECS:
+        parser.add_argument(flag, default=default_of(home), help=help_text)
+    # --path-env is a PATH string (os.pathsep-separated), not a single path:
+    # expanding the whole string as one path is semantically wrong (it would
+    # treat "~/a:~/b" as a single path). It is deliberately NOT in PATH_ARG_SPECS
+    # and gets no ~ expansion; fixtures must use absolute paths.
+    parser.add_argument("--path-env", default=None,
+                        help="override PATH search string (testing; no ~ expansion; "
+                             "segments separated by os.pathsep)")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="emit JSON instead of human-readable output")
+    return parser.parse_args()
+
+
+def normalize_path_args(args):
+    """Expand all path args once; return an error string on failure, else None.
+
+    Exception boundaries are centralized here, not patched at each
+    Path(...).expanduser() call - that is a one-missed-catch anti-pattern.
+    expanduser raises RuntimeError on unknown user forms (e.g. ~nobody), and
+    scattered call sites each risk a whole-doctor traceback with empty stdout.
+    """
+    for name in PATH_ARG_NAMES:
+        raw = getattr(args, name, None)
+        if raw is None:
+            continue
+        try:
+            setattr(args, name, str(Path(raw).expanduser()))
+        except (RuntimeError, ValueError, OSError) as error:
+            return f"--{name.replace('_', '-')} unresolvable ({raw!r}): {error}"
+    return None
+
+
+def print_results(checks, as_json):
+    summary = {s.lower(): sum(c["status"] == s for c in checks) for s in STATUS_ORDER}
+    if as_json:
+        print(json.dumps({"checks": checks, "summary": summary}))
+        return
+    for check in checks:
+        print(f"[{check['status']}] {check['name']} — {check['detail']}")
+    print("summary: " + ", ".join(f"{s} {summary[s.lower()]}" for s in STATUS_ORDER))
+
+
+def exit_code(checks):
+    statuses = {c["status"] for c in checks}
+    if "FAIL" in statuses:
+        return 2
+    if "WARN" in statuses:
+        return 1
+    return 0
+
+
+def main():
+    args = parse_args()
+    path_error = normalize_path_args(args)
+    if path_error:
+        print(path_error, file=sys.stderr)
+        return USAGE_EXIT_CODE
+    checks = []
+    check_versions(args, checks)
+    check_cli(args, checks)
+    check_runtime(args, checks)
+    check_data(args, checks)
+    print_results(checks, args.as_json)
+    return exit_code(checks)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

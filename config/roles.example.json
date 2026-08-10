@@ -1,0 +1,21 @@
+{
+  "_comment": "Human-readable starter roster. Replace placeholders and keep the field meanings in ../skills/orca-orchestrate/references/roster.md#the-shape-of-one-role.",
+  "roles": [
+    {
+      "id": "implementer",
+      "command": "claude --model <model-id> --effort <reasoning-level>",
+      "observability": "unknown",
+      "work_type": "Implement a scoped change and run its focused checks.",
+      "session_dir": "~/code/demo/.sessions/implementer",
+      "verified_on": "YYYY-MM-DD"
+    },
+    {
+      "id": "reviewer",
+      "command": "claude --model <model-id> --effort <reasoning-level>",
+      "observability": "unknown",
+      "work_type": "Review a proposed change for correctness, omissions, and leakage.",
+      "session_dir": "~/code/demo/.sessions/reviewer",
+      "verified_on": "YYYY-MM-DD"
+    }
+  ]
+}
