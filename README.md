@@ -66,6 +66,15 @@ claude plugin install orcastra@orcastra
 Restart Claude Code. The `orca-orchestrate` skill becomes available and loads on
 demand.
 
+> The `owner/repo` shorthand clones over **SSH**. If this machine has no GitHub
+> SSH key, pass the full HTTPS URL instead — that form clones over HTTPS:
+>
+> ```bash
+> claude plugin marketplace add https://github.com/eisen0419/orcastra.git
+> ```
+>
+> `(verified: both forms, 2026-08-10)`
+
 ### B) Bare symlink (no plugin infrastructure)
 
 ```bash
