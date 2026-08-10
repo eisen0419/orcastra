@@ -1,0 +1,19 @@
+{
+  "name": "orcastra",
+  "owner": {
+    "name": "orcastra contributors",
+    "url": "https://github.com/eisen0419/orcastra"
+  },
+  "description": "Production-grade coordination practices for running Claude Code as a reliable Orca orchestration coordinator.",
+  "plugins": [
+    {
+      "name": "orcastra",
+      "source": "./",
+      "description": "Coordinate Orca orchestration workers from Claude Code: dispatch a task, confirm it actually arrived, collect completion through a binding-independent channel, and verify before closing.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/eisen0419/orcastra#readme",
+      "category": "orchestration"
+    }
+  ]
+}

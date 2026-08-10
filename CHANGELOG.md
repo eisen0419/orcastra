@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Repository skeleton: MIT `LICENSE`, `.gitignore`, `.claude-plugin/plugin.json`.
+- Repository skeleton: MIT `LICENSE`, `.gitignore`, and both plugin manifests
+  (`.claude-plugin/plugin.json` for the plugin itself, and
+  `.claude-plugin/marketplace.json` so the repo can be added as a marketplace).
 - English `README.md` with dual-reader layout (human intro + Claude bootstrap) and
   two installation paths (plugin install, bare symlink).
 - `CONTRIBUTING.md` capturing the five design DNA principles, the three-tier

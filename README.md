@@ -59,7 +59,7 @@ orcastra teaches.
 ### A) As a Claude Code plugin (recommended)
 
 ```bash
-claude plugin marketplace add github.com/eisen0419/orcastra
+claude plugin marketplace add eisen0419/orcastra
 claude plugin install orcastra@orcastra
 ```
 
