@@ -14,7 +14,7 @@ these same keys:
 | Key | Record |
 | --- | --- |
 | `id` | A stable dispatch name. Keep it when the model generation changes; update the entry rather than every reference to it. |
-| `command` | The complete startup command, including explicit `--model <model-id>` and `--effort <reasoning-level>` arguments. This is the string passed to the terminal-creation step in the repository's `docs/quickstart.md`. The `--command` input is supported by the current Orca terminal-create interface (verified: Orca 1.4.176, 2026-08-10). |
+| `command` | The complete startup command, including explicit `--model <model-id>` and `--effort <reasoning-level>` arguments. This is the string passed to the terminal-creation step in the repository's `docs/quickstart.md`. The `--command` input is supported by the current Orca terminal-create interface (verified: Orca 1.4.180, 2026-08-12). |
 | `observability` | A tier such as `readable`, `limited`, or `unknown` describing whether the worker transcript is expected to be readable. Record the result, because it determines how well a failure can be diagnosed. |
 | `work_type` | One sentence about the shape of work this role fits, such as implementing a scoped change or reviewing a proposed change. This is a routing description, not a quality ranking. |
 | `session_dir` | The directory where this agent's session or transcript lands. Use it to check whether a worker received the task; replace the neutral example path with the path used by your setup. |

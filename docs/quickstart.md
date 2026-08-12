@@ -43,7 +43,7 @@ SSH / remote-server hosts behave differently and are out of scope here.
 > orca repo add --path /absolute/path/to/your/project --json
 > ```
 >
-> `(verified: Orca 1.4.176, 2026-08-10)` Then run this walkthrough from inside a
+> `(verified: Orca 1.4.180, 2026-08-12)` Then run this walkthrough from inside a
 > managed worktree.
 
 ## 1. Create a run
@@ -73,7 +73,10 @@ Expected (fictional):
 orchestration, terminal, and worktree commands all use it. (Local introspection
 commands such as `orca agent-context --json` do not.) The id you want is at
 `.result.run.id`; the top-level `.id` is the *request* id and looks nothing like
-a Run id. `(verified: Orca 1.4.176, 2026-08-10)` To keep this walkthrough
+a Run id — it is a UUID. The four envelope keys `id` / `ok` / `result` / `_meta`
+were read back from `orchestration run-list`, `terminal list`, and
+`worktree list`, and `agent-context --json` returned a bare object with no
+envelope. `(verified: Orca 1.4.180, 2026-08-12)` To keep this walkthrough
 readable, every later "Expected" block shows only the `result` payload.
 
 Save the `run_…` id. If you see something else →
@@ -121,8 +124,10 @@ Expected `result` payload (fictional):
 { "terminal": { "handle": "term_1c2d...", ... } }
 ```
 
-`--worktree active` / `--command` / `--title` are the relevant flags here.
-`(verified: Orca 1.4.176, 2026-08-09)` Wait for the agent TUI to be idle before
+`--worktree active` / `--command` / `--title` are the relevant flags here — all
+three are present on `terminal create --help`, which documents the selector as
+accepting `active`/`current` among other forms.
+`(verified: Orca 1.4.180, 2026-08-12)` Wait for the agent TUI to be idle before
 dispatching (see the official skill's `terminal wait --for tui-idle`).
 
 **Step 3b — register it as a supervised worker:**
@@ -136,8 +141,12 @@ orca orchestration worker-start \
 ```
 
 `--terminal` (reuse an existing terminal) cannot combine with `--model`; that
-is why provider choice is settled in step 3a, not here.
-`(verified: Orca 1.4.176, 2026-08-09)` If you see something else →
+is why provider choice is settled in step 3a, not here. The same restriction
+covers `--effort`, which itself requires `--model` — so neither the model nor
+the reasoning level can be set on this call once you supply `--terminal`. That
+is the whole reason the two-step start exists. Both restrictions are stated in
+the `worker-start --help` Notes.
+`(verified: Orca 1.4.180, 2026-08-12)` If you see something else →
 `../skills/orca-orchestrate/references/pitfalls.md`.
 
 ## 4. Confirm delivery
@@ -245,8 +254,17 @@ orca terminal close --terminal term_1c2d...
 
 `worker-read` keeps working after release on this path anyway — verified with
 `archive: null`, transcript still readable.
-`(verified: Orca 1.4.176, 2026-08-10)` If you see something else →
-`../skills/orca-orchestrate/references/pitfalls.md`.
+`(verified: Orca 1.4.176, 2026-08-10)` That stamp is deliberately **not** bumped
+to 1.4.180: obtaining the payload requires actually releasing a worker, which is
+a mutating call, and this round was read-only. What the current build does
+confirm is the surrounding contract, from the `worker-release --help` Notes: it
+closes only the worker's own coordinator-owned terminal and *never* a reused or
+pre-existing one (which is why yours is retained); an inspectable output archive
+is preserved before a terminal closes, so `worker-read` still returns output
+afterwards; the call is idempotent, reporting `already_released` on a repeat; and
+`retained` exits 0, so the outcome above is a success at the exit-code level too.
+`(verified: Orca 1.4.180, 2026-08-12 — help Notes only.)` If you see something
+else → `../skills/orca-orchestrate/references/pitfalls.md`.
 
 ---
 

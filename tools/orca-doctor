@@ -13,7 +13,9 @@ Zero third-party dependencies (standard library only). Never writes to anything
 it inspects. Path layout assumptions are stamped with the Orca version they were
 verified against; override every path with flags when needed.
 
-Path layout verified against Orca 1.4.176 (2026-08-09).
+Path layout verified against Orca 1.4.180 (2026-08-12): all four checks were run
+end to end on that build and returned OK, and the profile data file and its
+rolling backups were read directly.
 """
 
 import argparse
@@ -33,7 +35,7 @@ from xml.parsers import expat
 STATUS_ORDER = ("OK", "WARN", "FAIL", "SKIP")
 APP_VERSION_KEY = "CFBundleShortVersionString"
 
-# --- on-disk layout (verified: Orca 1.4.176, 2026-08-09) --------------------
+# --- on-disk layout (verified: Orca 1.4.180, 2026-08-12) --------------------
 # All landing points are overridable via flags; these are the canonical defaults
 # for a standard macOS install of Orca.
 
@@ -197,7 +199,9 @@ def check_cli(args, checks):
     The historical danger (Orca issue #8608) is a stray `orca` binary shadowing
     the app-bundled CLI, causing CLI calls to connect to the wrong runtime.
     Earlier Orca versions also shipped an SSH-relay CLI endpoint; retired — the
-    app CLI is the only known-good endpoint (verified: Orca 1.4.176, 2026-08-09).
+    app CLI is the only known-good endpoint (verified: Orca 1.4.180, 2026-08-12
+    for the app-CLI endpoint resolving cleanly; the relay's retirement is the
+    earlier 1.4.176 observation and was not re-checked).
     Any other resolvable binary winning PATH is a stray shadow and a FAIL. An
     unresolvable first candidate (broken link, resolve error) is a WARN - we
     cannot confirm it is the app CLI, but neither can we confirm it is a stray.

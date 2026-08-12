@@ -113,7 +113,11 @@ is degraded to read-only inspection and may not mutate. This is by design, not a
 hang. The official guide covers this under *Contract Migration*. The recovery
 command `run-use --id <adopted_run_id> --takeover-legacy` and the adopted-run
 objective string are documented in the guide (read on Orca 1.4.176); the
-rejection behavior itself was not reproduced for this entry.
+rejection behavior itself was not reproduced for this entry. The recovery flag is
+still present: `run-use --help` lists `--takeover-legacy` and states that it must
+run in the live coordinator agent terminal it binds, and that it preserves
+existing worker assignments. `(verified: Orca 1.4.180, 2026-08-12 — flag and its
+documented constraint; the takeover was not performed.)`
 
 **How to tell.** Run `orca orchestration run-list --json`. If you can list runs
 and they return normally, the runtime is healthy — you are not wedged. Look for
@@ -151,8 +155,14 @@ reflects the binding being created, not a prompt being delivered. The official
 guide states this division of labor: `--inject` is what sends the spec plus
 preamble into a recognized agent CLI; for a bare shell you omit `--inject`,
 dispatch only if you want tracking, then send the prompt yourself. The `--inject` flag is present on
-`dispatch --help` as of Orca 1.4.176 (verified); the no-delivery behavior was
+`dispatch --help` as of Orca 1.4.180 (verified); the no-delivery behavior was
 not reproduced for this entry.
+
+Two adjacent flags on the same subcommand make this trap cheaper to avoid than
+it used to be: `--dry-run` and `--return-preamble`. If you are unsure what a
+dispatch would actually deliver, ask for the preamble instead of guessing from
+the receipt. Both flags are present on `dispatch --help`; their output was not
+exercised here. `(verified: Orca 1.4.180, 2026-08-12)`
 
 **How to tell.** Read the worker terminal: `orca terminal read --terminal
 <handle> --json`. If the input area is empty (or still shows the agent's default
@@ -215,8 +225,9 @@ after the prompt, unsubmitted — the agent never starts working.
 
 **Mechanism.** Without `--enter`, `terminal send` places text into the input box
 but does not submit it. The receipt counts bytes accepted, not a submission. The
-`--enter` flag is present on `terminal send --help` as of Orca 1.4.176
-(verified); the no-submit behavior was not reproduced for this entry.
+`--enter` flag is present on `terminal send --help` as of Orca 1.4.180, described
+there as "Append Enter after sending text" (verified); the no-submit behavior was
+not reproduced for this entry.
 
 **How to tell.** `orca terminal read --terminal <handle> --json` shows the text
 sitting on the input line and the agent at 0 % context / idle. Contrast with
@@ -239,25 +250,38 @@ no-`--enter` sends for deliberately pre-filling the input for a human.
 `orca orchestration task-delete` / `task-cancel`. The command does not exist.
 
 **Mechanism.** The `orchestration` command surface (verified via
-`orca orchestration --help` on Orca 1.4.176) has `task-create`, `task-list`,
+`orca orchestration --help` on Orca 1.4.180) has `task-create`, `task-list`,
 `task-update`, plus dispatch/worker/gate verbs — no delete, no cancel. The only
-mutation is `task-update --status`, whose valid values are `pending, ready,
-dispatched, completed, failed, blocked` (no `deleted`). Tasks are an execution
-queue, not an archive: once created, a task row is permanent.
+per-task mutation is `task-update --status`, whose valid values are `pending,
+ready, dispatched, completed, failed, blocked` (no `deleted`; the value set is
+printed in that subcommand's own `--help` Notes). Tasks are an execution queue,
+not an archive: once created, an individual task row cannot be removed.
+
+There is one scope-level exception, and it is not a way to fix one bad row:
+`orca orchestration reset` takes `--all | --tasks | --messages` and is described
+as resetting one explicit orchestration state scope. Its actual semantics —
+whether it clears rows or only resets their state, and what it does to a Run's
+history — were **not** exercised here, because running it is a destructive write
+against live orchestration state. Treat it as a blunt instrument for a scope you
+are willing to lose, never as `task-delete`.
 
 **How to tell.** `orca orchestration --help` lists no delete/cancel subcommand;
 `orca orchestration task-update --help` lists no `deleted` status. Both checked
-on Orca 1.4.176.
+on Orca 1.4.180.
 
 **What to do.** You cannot remove a wrong task. The least-misleading fix is
 `task-update --id <task_id> --status completed --result '{"note":"DUPLICATE,
 superseded by <task_id>"}'` — completed + a result note pointing at the real
 task. Do **not** mark it `failed` or `blocked`: those statuses read as a real
-problem and add noise to coordinator sweeps. Because deletion is impossible,
-dedup **before** creating: list the full task set for the run and match on spec
-(see entry 6).
+problem and add noise to coordinator sweeps. Because per-row deletion is
+impossible, dedup **before** creating: list the full task set for the run and
+match on spec (see entry 6).
 
-**Stamp.** `(verified: Orca 1.4.176, 2026-08-09)`
+**Stamp.** `(verified: Orca 1.4.180, 2026-08-12)` — the command surface, the
+absent delete/cancel verbs, and the `--status` value set were re-checked via
+`--help` on this build. The `reset` verb's presence and its flag set are
+`verified` on the same probe; its *semantics* are unexercised and carry no
+stamp, because confirming them requires a destructive write.
 
 ---
 
@@ -302,26 +326,45 @@ result is never proof of absence.
 `Invalid --deps: must be a JSON array of task IDs`.
 
 **Mechanism.** Each subcommand names its target differently (verified via
-`--help` on Orca 1.4.176): `task-create` takes `--spec <text>` (with optional
+`--help` on Orca 1.4.180): `task-create` takes `--spec <text>` (with optional
 `--task-title`), `dispatch` takes `--task <task_id>`, `task-update` takes
 `--id <task_id>`, `task-list` takes no id (it filters by `--status`/`--ready`/
 `--run`). `--deps` on `task-create` expects a JSON array, e.g.
 `--deps '["task_04bf…"]'`; a bare id is rejected. The good news: the `Unknown
 flag` error lists the subcommand's valid flags, so the correct form is in the
-error message.
+error message. Confirmed by passing a deliberately invalid flag: the reply is
+`Unknown flag <flag> for command: orchestration task-create` followed by a
+`Next step: Valid flags: …` line enumerating all of them, and it exits 1 —
+nothing is created, so this probe is safe to run.
+`(verified: Orca 1.4.180, 2026-08-12)`
 
-**How to tell.** Run `orca orchestration <command> --help`. The flags and their
-value shapes are listed. The JSON-array requirement for `--deps` is not spelled
-out in `--help` (the flag shows with no value hint); the rejection error states
-it exactly.
+**How to tell.** Run `orca orchestration <command> --help`. Each subcommand
+prints its own usage line with the flags and their value shapes — including
+`[--deps <json_array>]`, so the array requirement is now visible before you
+trigger the rejection. `(verified: Orca 1.4.180, 2026-08-12)`
+
+If your build shows `--deps` with no value hint, you are on an older CLI, where
+the array requirement was discoverable only from the rejection error
+`Invalid --deps: must be a JSON array of task IDs`
+`(historical: Orca 1.4.176 and earlier, 2026-08-09; the usage line now states
+the shape)`. The flag's *behavior* is unchanged either way — only its
+self-documentation improved, so this is a discoverability fix, not a contract
+change.
+
+Two related surfaces moved in the same direction on this build and are worth
+knowing before you guess a flag: `task-create` also accepts `--display-name`,
+`--parent <task_id>`, and `--from <handle>`, and `task-list` accepts `--brief`
+(it collapses whitespace and caps each spec at 160 characters — useful when a
+full listing is too noisy to scan for dedup). `(verified: Orca 1.4.180,
+2026-08-12)`
 
 **What to do.** On `Unknown flag`, read the error — it prints the valid flags
 for that subcommand; do not carry flag names over from a sibling subcommand. For
 `--deps`, pass a JSON array string: `--deps '["task_04bf…","task_7c2a…"]'`. When
 in doubt, `--help` before you commit to a flag form.
 
-**Stamp.** `(verified: Orca 1.4.176, 2026-08-09)` — the flag names, the absence
-of a delete verb, and the `--deps` flag presence were checked via `--help`. The
+**Stamp.** `(verified: Orca 1.4.180, 2026-08-12)` — the flag names, the absence
+of a delete verb, and the `--deps` value shape were checked via `--help`. The
 JSON-array-only rejection of a bare id is an observed behavior
 (Orca 1.4.13x, 2026-08-01), not reproduced here because triggering it requires a
 write; it is called out as observed in the Mechanism field above.

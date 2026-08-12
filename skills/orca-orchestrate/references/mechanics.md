@@ -106,8 +106,25 @@ root process; killing the agent CLI alone is not enough, because the shell/login
 beneath it keeps the PTY alive and Orca will re-adopt it as an empty shell.
 Before you assume a dispatched worker is gone, check the process table, not the
 tab bar.
-(verified: Orca 1.4.176, 2026-08-09 — the sleeping map and the live-PTY-with-no-tab
-reconciliation are both present in the on-disk session file this run)
+(verified: Orca 1.4.180, 2026-08-12 — the sleeping map is present in the on-disk
+profile data file and its shape matches the description above: a
+`sleepingAgentSessionsByPaneKey` map keyed by pane key, each record carrying
+`agent`, a `providerSession` object with `id` / `key` / `transcriptPath`, plus
+`state`, `origin`, `tabId`, and `worktreeId`. The *reconciliation* step is
+runtime behavior and was not observed directly this round; only its on-disk
+input was.)
+
+Two details of that map are worth reading before you rely on this section. The
+records span more than one agent CLI, which is the concrete form of "not limited
+to an allowlist." And a `settings.experimentalAgentHibernation` flag exists —
+so this is a configurable surface, not an immutable law — but the flag being
+**off** does not empty the map: on the machine checked here it was `false` while
+the map still held dozens of records, every one of them in `state: working`.
+Do not read the flag as a switch that makes the sleeping map go away, and do not
+read a populated map as proof the feature is enabled.
+(verified: Orca 1.4.180, 2026-08-12 — flag value and map contents read from the
+same file in one pass; the causal relationship between them was **not**
+established and should not be inferred from this.)
 
 A corollary worth stamping: the supervised-worker path (`worker-start`) and bare
 `dispatch` differ at the phenomenon level. A closed supervised window stays
@@ -116,7 +133,11 @@ left in the live/working state and is re-adopted on every reconciliation. The
 exact trigger that clears the supervised record is not pinned down — do not
 assume it is "on completion" or cite any timing for it. This is the mechanical
 reason "prefer supervised workers" is not just style.
-(observed: Orca 1.4.176, 2026-08-07)
+(observed: Orca 1.4.176, 2026-08-07 — the phenomenon-level contrast between the
+two paths. The "left in the working state" half of the explanation is stronger
+than that: every record in the map read on Orca 1.4.180 (2026-08-12) carried
+`state: working`, including records whose `origin` was already `quit`, which is
+exactly the condition that makes a stale record eligible for re-adoption.)
 
 ## 4. The terminal's authoritative model lives in the backend
 
@@ -164,6 +185,15 @@ handle.
 dormant on a pure-local setup since the SSH relay path was retired, but
 intra-session rotation still occurs. Treat the "stale handle" failure mode as
 live.)
+
+The *structure* of the durable key is firmer than the rotation behavior above:
+the on-disk sleeping map is keyed by pane key, each key is a two-segment
+colon-delimited string with both segments populated, and each record also stores
+its `tabId` separately — consistent with the `tabId:leafId` pair described here.
+A `legacyPaneKeyAliasEntries` list exists alongside it, which is where alias
+bookkeeping for older keys would live; it was empty on the machine checked.
+(verified: Orca 1.4.180, 2026-08-12 — key shape and the alias list's existence.
+The alias list being empty is one machine's state, not a claim about yours.)
 
 ## 6. Run identity, ownership, and lifecycle
 

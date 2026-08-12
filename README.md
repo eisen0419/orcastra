@@ -43,10 +43,10 @@ $ orca orchestration worker-start --task task_04bf... \
 dispatched → ctx_803a...  (stage: input_accepted)   # delivery OBSERVED, not inferred
 ```
 
-*(verified: Orca 1.4.176, 2026-08-09) — each verb above was confirmed against
+*(verified: Orca 1.4.180, 2026-08-12) — each verb above was confirmed against
 `orca orchestration --help`; `run-create` creates the Run and binds the invoking
 terminal as its coordinator (worker-terminal binding happens later, at
-`worker-start --run`).)*
+`worker-start --run`).*
 
 The worker runs in its own terminal. When it finishes it sends `worker_done`.
 The coordinator does **not** trust that signal alone — it reads the worker's
