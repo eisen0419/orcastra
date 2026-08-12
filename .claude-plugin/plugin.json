@@ -1,6 +1,6 @@
 {
   "name": "orcastra",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Production-grade coordination practices for running Claude Code as a reliable Orca orchestration coordinator: verified delivery, idempotent closeout, independent review.",
   "author": {
     "name": "orcastra contributors",

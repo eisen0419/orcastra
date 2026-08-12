@@ -8,9 +8,11 @@ API *is*. orcastra teaches your Claude Code how to *run a reliable coordinator
 loop*: verify delivery, close out idempotently, review independently, and know
 where the traps are on the map.
 
-> **Status:** `0.1.0` — first release. Every behavioral claim carries a version
-> stamp; see [`docs/compat.md`](./docs/compat.md) for the Orca versions these
-> were checked against, and [CHANGELOG.md](./CHANGELOG.md) for what shipped.
+> **Status:** `0.1.1` — read-only claims re-checked against Orca 1.4.180. Every
+> behavioral claim carries a version stamp; see
+> [`docs/compat.md`](./docs/compat.md) for the Orca versions these were checked
+> against — including which claims each round did *not* re-check — and
+> [CHANGELOG.md](./CHANGELOG.md) for what shipped.
 
 ## What it is
 

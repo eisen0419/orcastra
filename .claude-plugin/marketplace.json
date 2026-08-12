@@ -10,7 +10,7 @@
       "name": "orcastra",
       "source": "./",
       "description": "Coordinate Orca orchestration workers from Claude Code: dispatch a task, confirm it actually arrived, collect completion through a binding-independent channel, and verify before closing.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "license": "MIT",
       "homepage": "https://github.com/eisen0419/orcastra#readme",
       "category": "orchestration"
