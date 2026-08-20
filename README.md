@@ -97,11 +97,17 @@ when the plugin marketplace is unavailable.
 
 ```bash
 ~/orcastra/tools/orca-doctor     # checks Orca version, CLI resolution, runtime handshake
+~/orcastra/tools/orca-auth       # which agent-CLI seats are logged in, and how to fix the rest
 ```
 
 `orca-doctor` ships with this repository. It reports all-green, or
 states plainly what is missing (Orca not installed / runtime unreachable /
 profile corrupted) — it never reports success on a dead runtime.
+
+`orca-auth` is the seat-login preflight: for each agent CLI it runs the
+official headless status command (read-only, zero credential contact) and
+reports OK / ATTN with the login command to run. Credentials stay with each
+CLI's own storage — orcastra never sees them.
 
 ## Bootstrap for your Claude Code
 

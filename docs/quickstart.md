@@ -25,6 +25,7 @@ first — this kit does not tutor Orca installation.
 ```bash
 orca terminal list --json          # must return a list
 ./tools/orca-doctor                # all-green, or it says plainly what's missing
+./tools/orca-auth                  # which seat CLIs are logged in; ATTN rows tell you the login command
 orca worktree list --json          # your working directory must be inside one of these
 ```
 

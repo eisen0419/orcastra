@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Read-only login-state preflight for the agent-CLI seats an Orca coordinator uses.
+
+For each known seat CLI, run its official headless status command (or a
+degraded file-existence probe where none exists) and report per seat:
+  OK        - the logged-in shape matched
+  ATTN      - binary present but the shape did not match (not logged in,
+              network error, output drift, timeout - the tool does not guess
+              which; it quotes the raw output and points at the login command)
+  MISSING   - binary not on PATH (informational: you may not use that seat)
+  DEGRADED  - grok only: credentials file exists (existence != validity)
+
+Contract (see the repo's auth-preflight spec):
+  - read-only: never triggers a login flow, never writes to anything it checks
+  - zero credential contact: never passes flags that emit credential values,
+    never reads a credential file's content (grok probe is a stat only)
+  - stdlib only; per-seat probes are bounded by a timeout and run in parallel
+
+Honesty note: every OK predicate is a *logged-in* shape match, verified on a
+machine where all seats were logged in (2026-08-20). Logged-*out* output shapes
+were not sampled, which is exactly why ATTN does not claim a reason.
+
+Exit codes: 0 = every installed seat OK/DEGRADED, 1 = ATTN present,
+64 = usage error.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+STATUS_ORDER = ("OK", "DEGRADED", "ATTN", "MISSING")
+USAGE_EXIT_CODE = 64
+DETAIL_QUOTE_LIMIT = 200
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text)
+
+
+def quote_output(text):
+    flat = " ".join(strip_ansi(text).split())
+    if len(flat) > DETAIL_QUOTE_LIMIT:
+        return flat[:DETAIL_QUOTE_LIMIT] + "..."
+    return flat
+
+
+def run_probe(argv, timeout):
+    """Run one probe command, bounded. Returns (rc, combined_output, timed_out)."""
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            text=True,
+            errors="replace",
+        )
+        return proc.returncode, proc.stdout or "", False
+    except subprocess.TimeoutExpired as err:
+        out = err.stdout
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        return None, out or "", True
+    except OSError as err:
+        return None, str(err), False
+
+
+# --- per-seat OK predicates (logged-in shapes, verified 2026-08-20) ---------
+
+def ok_claude(rc, out):
+    # claude auth status prints JSON: {"loggedIn": true, ...}  (verified: 2.1.237)
+    if rc != 0:
+        return False
+    try:
+        return json.loads(out).get("loggedIn") is True
+    except ValueError:
+        return False
+
+
+def ok_codex(rc, out):
+    # codex login status -> "Logged in using ChatGPT"  (verified: 0.148.0)
+    return rc == 0 and "Logged in" in out
+
+
+def ok_opencode(rc, out):
+    # opencode auth list ends with "N credentials" (ANSI-decorated)  (verified: 1.18.3)
+    if rc != 0:
+        return False
+    match = re.search(r"(\d+)\s+credentials?\b", strip_ansi(out))
+    return bool(match) and int(match.group(1)) >= 1
+
+
+def ok_cursor(rc, out):
+    # cursor-agent status -> "✓ Logged in as ..."  (verified: 2026.08.11)
+    return rc == 0 and "Logged in" in out
+
+
+def ok_pi(rc, out):
+    # pi auth check --provider P --json --no-refresh -> {"status": "ready", ...}
+    # (verified: 0.84.2). --no-refresh is mandatory: the default refreshes
+    # expired OAuth credentials, which violates the read-only contract.
+    if rc != 0:
+        return False
+    try:
+        return json.loads(out).get("status") == "ready"
+    except ValueError:
+        return False
+
+
+SEATS = (
+    # (seat, binary, probe argv, predicate, login hint, stamp)
+    ("claude", "claude", ["auth", "status"], ok_claude,
+     "claude auth login", "verified: claude 2.1.237, 2026-08-20"),
+    ("codex", "codex", ["login", "status"], ok_codex,
+     "codex login", "verified: codex-cli 0.148.0, 2026-08-20"),
+    ("opencode", "opencode", ["auth", "list"], ok_opencode,
+     "opencode auth login", "verified: opencode 1.18.3, 2026-08-20"),
+    ("cursor", "cursor-agent", ["status"], ok_cursor,
+     "cursor-agent login", "verified: cursor-agent 2026.08.11, 2026-08-20"),
+)
+
+PI_STAMP = "verified: pi 0.84.2, 2026-08-20"
+GROK_STAMP = ("observed: grok 1.0.5, 2026-08-20 - existence-only probe, "
+              "no logged-out sample")
+
+# roles command word -> seat name (spec: first word of a role's command)
+COMMAND_WORD_TO_SEAT = {
+    "claude": "claude",
+    "codex": "codex",
+    "pi": "pi",
+    "opencode": "opencode",
+    "cursor-agent": "cursor",
+    "grok": "grok",
+}
+
+
+def add_result(results, seat, status, detail, hint, stamp):
+    results.append({
+        "seat": seat, "status": status, "detail": detail,
+        "hint": hint, "stamp": stamp,
+    })
+
+
+def probe_simple_seat(seat, binary, args, predicate, hint, stamp, timeout):
+    path = shutil.which(binary)
+    if path is None:
+        return (seat, "MISSING", f"`{binary}` not on PATH", hint, stamp)
+    rc, out, timed_out = run_probe([path] + args, timeout)
+    if timed_out:
+        return (seat, "ATTN", f"probe timed out after {timeout}s", hint, stamp)
+    if predicate(rc, out):
+        return (seat, "OK", "logged-in shape matched", hint, stamp)
+    return (seat, "ATTN",
+            f"rc={rc}; output: {quote_output(out)}", hint, stamp)
+
+
+def pi_provider_set(cli_providers, settings_path):
+    """Resolve which pi providers to probe. Returns (providers, note)."""
+    if cli_providers:
+        return [p for p in cli_providers.split(",") if p.strip()], None
+    try:
+        with open(settings_path, encoding="utf-8") as fh:
+            settings = json.load(fh)
+    except (OSError, ValueError):
+        return [], f"no --pi-providers and {settings_path} unreadable"
+    provider = settings.get("defaultProvider")
+    if isinstance(provider, str) and provider:
+        return [provider], None
+    return [], f"no --pi-providers and no defaultProvider in {settings_path}"
+
+
+def probe_pi_seat(cli_providers, settings_path, timeout):
+    hint = "run pi and use /login"
+    path = shutil.which("pi")
+    if path is None:
+        return [("pi", "MISSING", "`pi` not on PATH", hint, PI_STAMP)]
+    providers, note = pi_provider_set(cli_providers, settings_path)
+    if not providers:
+        return [("pi", "ATTN", f"{note}; pass --pi-providers a,b", hint, PI_STAMP)]
+    results = []
+    for provider in providers:
+        seat = f"pi[{provider}]"
+        rc, out, timed_out = run_probe(
+            [path, "auth", "check", "--provider", provider, "--json", "--no-refresh"],
+            timeout)
+        if timed_out:
+            results.append((seat, "ATTN", f"probe timed out after {timeout}s",
+                            hint, PI_STAMP))
+        elif ok_pi(rc, out):
+            results.append((seat, "OK", "logged-in shape matched", hint, PI_STAMP))
+        else:
+            results.append((seat, "ATTN", f"rc={rc}; output: {quote_output(out)}",
+                            hint, PI_STAMP))
+    return results
+
+
+def probe_grok_seat(auth_file):
+    hint = "grok login"
+    if shutil.which("grok") is None:
+        return ("grok", "MISSING", "`grok` not on PATH", hint, GROK_STAMP)
+    # Degraded tier: grok has no headless status command (only login/logout),
+    # so this is a stat-only existence probe. Existence != validity.
+    try:
+        size = os.stat(auth_file).st_size
+    except OSError:
+        return ("grok", "ATTN",
+                f"no credentials file at {auth_file}", hint, GROK_STAMP)
+    if size > 2:
+        return ("grok", "DEGRADED",
+                f"credentials file present ({auth_file}); existence-only probe,"
+                " validity not checked", hint, GROK_STAMP)
+    return ("grok", "ATTN", f"credentials file empty at {auth_file}", hint, GROK_STAMP)
+
+
+def roles_seat_filter(roles_path):
+    """Read a roles config; return the set of seats its commands use."""
+    with open(roles_path, encoding="utf-8") as fh:
+        config = json.load(fh)
+    seats = set()
+    for role in config.get("roles", []):
+        command = role.get("command", "")
+        words = command.split()
+        if not words:
+            continue
+        seat = COMMAND_WORD_TO_SEAT.get(words[0])
+        if seat is not None:
+            seats.add(seat)
+    return seats
+
+
+def print_results(results, as_json):
+    summary = {s.lower(): 0 for s in STATUS_ORDER}
+    for row in results:
+        summary[row["status"].lower()] += 1
+    if as_json:
+        print(json.dumps({"seats": results, "summary": summary}))
+        return
+    for row in results:
+        line = f"[{row['status']}] {row['seat']} — {row['detail']}"
+        if row["status"] in ("ATTN", "MISSING"):
+            line += f"  (to fix: {row['hint']})"
+        print(line)
+        print(f"          {row['stamp']}")
+    print("summary: " + ", ".join(
+        f"{s} {summary[s.lower()]}" for s in STATUS_ORDER))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read-only login-state preflight for agent-CLI seats.")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="emit machine-readable JSON")
+    parser.add_argument("--roles", metavar="PATH",
+                        help="roles config (config/roles.example.json shape); "
+                             "limits seats to those its commands use and "
+                             "escalates their MISSING to ATTN")
+    parser.add_argument("--pi-providers", metavar="A,B", default="",
+                        help="pi providers to probe (default: defaultProvider "
+                             "from --pi-settings)")
+    parser.add_argument("--pi-settings", metavar="PATH",
+                        default=os.path.expanduser("~/.pi/agent/settings.json"),
+                        help="pi settings file to read defaultProvider from")
+    parser.add_argument("--grok-auth-file", metavar="PATH",
+                        default=os.path.expanduser("~/.grok/auth.json"),
+                        help="grok credentials file to stat (existence only)")
+    parser.add_argument("--timeout", type=float, default=10.0,
+                        help="per-probe timeout in seconds (default 10)")
+
+    try:
+        args = parser.parse_args()
+    except SystemExit as err:
+        raise SystemExit(USAGE_EXIT_CODE if err.code not in (0,) else 0)
+
+    seat_filter = None
+    if args.roles:
+        try:
+            seat_filter = roles_seat_filter(args.roles)
+        except (OSError, ValueError) as err:
+            print(f"cannot read roles config {args.roles}: {err}", file=sys.stderr)
+            raise SystemExit(USAGE_EXIT_CODE)
+
+    rows = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = []
+        for seat, binary, probe_args, predicate, hint, stamp in SEATS:
+            if seat_filter is not None and seat not in seat_filter:
+                continue
+            futures.append(pool.submit(
+                probe_simple_seat, seat, binary, probe_args, predicate,
+                hint, stamp, args.timeout))
+        run_pi = seat_filter is None or "pi" in seat_filter
+        run_grok = seat_filter is None or "grok" in seat_filter
+        pi_future = pool.submit(
+            probe_pi_seat, args.pi_providers, args.pi_settings,
+            args.timeout) if run_pi else None
+        grok_future = pool.submit(
+            probe_grok_seat, args.grok_auth_file) if run_grok else None
+        for future in futures:
+            rows.append(future.result())
+        if pi_future is not None:
+            rows.extend(pi_future.result())
+        if grok_future is not None:
+            rows.append(grok_future.result())
+
+    results = []
+    for seat, status, detail, hint, stamp in rows:
+        # Under --roles, a seat the config needs but the machine lacks is a
+        # real problem, not information.
+        if seat_filter is not None and status == "MISSING":
+            status, detail = "ATTN", detail + " (required by roles config)"
+        add_result(results, seat, status, detail, hint, stamp)
+    results.sort(key=lambda row: row["seat"])
+
+    print_results(results, args.as_json)
+    attn = sum(1 for row in results if row["status"] == "ATTN")
+    raise SystemExit(1 if attn else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -50,7 +50,7 @@ Load these on demand — none of them is loaded with this entry point.
 | write a brief that can be accepted mechanically | `references/delivery-contract.md` |
 | decide how hard to review, and when the loop is closed | `references/review-loop.md` |
 | name your worker roles instead of improvising each time | `references/roster.md` |
-| check your environment before blaming the code | `tools/orca-doctor` in the orcastra repo |
+| check your environment before blaming the code | `tools/orca-doctor` / `tools/orca-auth` |
 | see which Orca builds these claims were checked against | `docs/compat.md` in the orcastra repo |
 
 Routing: *"how do I do it"* → quickstart. *"why did it do that"* →

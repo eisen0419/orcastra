@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tools/orca-auth` — read-only login-state preflight for the six agent-CLI
+  seats (claude / codex / pi / opencode / cursor / grok). Runs each CLI's
+  official headless status command (grok: degraded existence-only probe),
+  reports OK / ATTN / MISSING / DEGRADED with the login command to run, and
+  never touches credentials. `--roles` limits seats to a roles config and
+  escalates required-but-missing seats; `--json` for scripting.
+- `tools/test-auth.sh` — self-test against PATH-injected mock CLIs
+  (33 assertions, incl. zero-credential argv checks).
+
 ## [0.1.1] - 2026-08-12
 
 ### Changed
