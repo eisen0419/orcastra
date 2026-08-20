@@ -39,15 +39,36 @@ DETAIL_QUOTE_LIMIT = 200
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+# --- redaction (spec v1.1 §2.2) --------------------------------------------
+# Every ATTN detail quotes raw CLI output, so it passes through redact() first:
+# sensitive-looking JSON field values, Bearer/Authorization values, and any
+# >=24-char opaque run are replaced. Over-redaction is acceptable; leaking a
+# credential into a report is not. Human and --json output share this result.
+
+REDACTED = "[redacted]"
+SENSITIVE_FIELD_RE = re.compile(
+    r'(?i)("[^"]*(?:token|key|secret|password|credential|authorization)[^"]*"'
+    r'\s*:\s*)("(?:[^"\\]|\\.)*"|[^,}\]\s]+)')
+BEARER_RE = re.compile(r"(?i)\b(bearer|authorization:?)([ =:]+)\S+")
+OPAQUE_RUN_RE = re.compile(r"\b[A-Za-z0-9_.\-]{24,}\b")
+
+
+def redact(text):
+    text = SENSITIVE_FIELD_RE.sub(lambda m: m.group(1) + '"' + REDACTED + '"', text)
+    text = BEARER_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    return OPAQUE_RUN_RE.sub(REDACTED, text)
+
 
 def strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
 def quote_output(text):
-    flat = " ".join(strip_ansi(text).split())
-    if len(flat) > DETAIL_QUOTE_LIMIT:
-        return flat[:DETAIL_QUOTE_LIMIT] + "..."
+    """Redact, flatten, and truncate to a UTF-8 byte budget (ellipsis included)."""
+    flat = " ".join(strip_ansi(redact(text)).split())
+    raw = flat.encode("utf-8")
+    if len(raw) > DETAIL_QUOTE_LIMIT:
+        return raw[: DETAIL_QUOTE_LIMIT - 3].decode("utf-8", "ignore") + "..."
     return flat
 
 
@@ -75,14 +96,25 @@ def run_probe(argv, timeout):
 
 # --- per-seat OK predicates (logged-in shapes, verified 2026-08-20) ---------
 
+def _json_dict(out):
+    """Parse out as JSON and return it only if it is an object; else None.
+
+    A list/null/bool/number is legal JSON but the wrong shape - it must land
+    in ATTN, not raise AttributeError out of the probe thread (spec v1.1 §4).
+    """
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def ok_claude(rc, out):
     # claude auth status prints JSON: {"loggedIn": true, ...}  (verified: 2.1.237)
     if rc != 0:
         return False
-    try:
-        return json.loads(out).get("loggedIn") is True
-    except ValueError:
-        return False
+    data = _json_dict(out)
+    return data is not None and data.get("loggedIn") is True
 
 
 def ok_codex(rc, out):
@@ -109,10 +141,8 @@ def ok_pi(rc, out):
     # expired OAuth credentials, which violates the read-only contract.
     if rc != 0:
         return False
-    try:
-        return json.loads(out).get("status") == "ready"
-    except ValueError:
-        return False
+    data = _json_dict(out)
+    return data is not None and data.get("status") == "ready"
 
 
 SEATS = (
@@ -156,7 +186,11 @@ def probe_simple_seat(seat, binary, args, predicate, hint, stamp, timeout):
     rc, out, timed_out = run_probe([path] + args, timeout)
     if timed_out:
         return (seat, "ATTN", f"probe timed out after {timeout}s", hint, stamp)
-    if predicate(rc, out):
+    try:
+        matched = predicate(rc, out)
+    except Exception as err:  # a predicate bug must degrade one seat, not the run
+        return (seat, "ATTN", f"predicate error: {err}", hint, stamp)
+    if matched:
         return (seat, "OK", "logged-in shape matched", hint, stamp)
     return (seat, "ATTN",
             f"rc={rc}; output: {quote_output(out)}", hint, stamp)
@@ -165,7 +199,7 @@ def probe_simple_seat(seat, binary, args, predicate, hint, stamp, timeout):
 def pi_provider_set(cli_providers, settings_path):
     """Resolve which pi providers to probe. Returns (providers, note)."""
     if cli_providers:
-        return [p for p in cli_providers.split(",") if p.strip()], None
+        return [p.strip() for p in cli_providers.split(",") if p.strip()], None
     try:
         with open(settings_path, encoding="utf-8") as fh:
             settings = json.load(fh)
@@ -293,9 +327,9 @@ def main():
         for seat, binary, probe_args, predicate, hint, stamp in SEATS:
             if seat_filter is not None and seat not in seat_filter:
                 continue
-            futures.append(pool.submit(
+            futures.append((seat, hint, stamp, pool.submit(
                 probe_simple_seat, seat, binary, probe_args, predicate,
-                hint, stamp, args.timeout))
+                hint, stamp, args.timeout)))
         run_pi = seat_filter is None or "pi" in seat_filter
         run_grok = seat_filter is None or "grok" in seat_filter
         pi_future = pool.submit(
@@ -303,12 +337,26 @@ def main():
             args.timeout) if run_pi else None
         grok_future = pool.submit(
             probe_grok_seat, args.grok_auth_file) if run_grok else None
-        for future in futures:
-            rows.append(future.result())
+        # Depth guard: one seat's unexpected exception degrades that seat to
+        # ATTN instead of tracebacking the whole run (spec v1.1 §4).
+        for seat, hint, stamp, future in futures:
+            try:
+                rows.append(future.result())
+            except Exception as err:
+                rows.append((seat, "ATTN", f"internal probe error: {err}",
+                             hint, stamp))
         if pi_future is not None:
-            rows.extend(pi_future.result())
+            try:
+                rows.extend(pi_future.result())
+            except Exception as err:
+                rows.append(("pi", "ATTN", f"internal probe error: {err}",
+                             "run pi and use /login", PI_STAMP))
         if grok_future is not None:
-            rows.append(grok_future.result())
+            try:
+                rows.append(grok_future.result())
+            except Exception as err:
+                rows.append(("grok", "ATTN", f"internal probe error: {err}",
+                             "grok login", GROK_STAMP))
 
     results = []
     for seat, status, detail, hint, stamp in rows:

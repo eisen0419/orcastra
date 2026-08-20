@@ -106,7 +106,7 @@ profile corrupted) — it never reports success on a dead runtime.
 
 `orca-auth` is the seat-login preflight: for each agent CLI it runs the
 official headless status command (read-only, zero credential contact) and
-reports OK / ATTN with the login command to run. Credentials stay with each
+reports OK / ATTN / MISSING / DEGRADED with the login command to run. Credentials stay with each
 CLI's own storage — orcastra never sees them.
 
 ## Bootstrap for your Claude Code

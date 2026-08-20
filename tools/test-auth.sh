@@ -101,11 +101,16 @@ assert_seat cursor OK S1
 assert_seat "pi[mockprov]" OK S1
 assert_seat grok DEGRADED S1
 
-# --- S2: zero-credential argv assertions ------------------------------------
-if grep -q -- '--no-refresh' "$ARGLOG/pi.argv" && ! grep -q -- '--credentials' "$ARGLOG/pi.argv"; then
+# --- S2: zero-credential argv assertions (all seats, not only pi) -----------
+if grep -q -- '--no-refresh' "$ARGLOG/pi.argv"; then
     ok
 else
-    fail "[S2] pi argv: want --no-refresh present and --credentials absent; got: $(cat "$ARGLOG/pi.argv")"
+    fail "[S2] pi argv lacks --no-refresh; got: $(cat "$ARGLOG/pi.argv")"
+fi
+if grep -l -- '--credentials' "$ARGLOG"/*.argv 2>/dev/null; then
+    fail "[S2] --credentials found in argv logs: $(grep -l -- '--credentials' "$ARGLOG"/*.argv)"
+else
+    ok
 fi
 
 # --- S3: sentinel from an OK seat's raw output never reaches --json ---------
@@ -183,6 +188,72 @@ run_auth "${STD_FLAGS[@]}" --pi-providers alpha,beta
 assert_exit 0 S14
 assert_seat "pi[alpha]" OK S14
 assert_seat "pi[beta]" OK S14
+
+# --- S15: ATTN-shape sentinel must be redacted (human and --json) -----------
+mock_all_green
+mk_mock claude "echo '{\"loggedIn\": false, \"token\": \"$SENTINEL\"}'"
+run_auth "${STD_FLAGS[@]}"
+assert_exit 1 S15
+assert_seat claude ATTN S15
+if printf '%s' "$RUN_OUT" | grep -q "$SENTINEL"; then
+    fail "[S15] sentinel leaked into --json ATTN detail"
+else
+    ok
+fi
+run_auth --pi-settings "$PISET" --grok-auth-file "$GROKAUTH"   # human output
+if printf '%s' "$RUN_OUT" | grep -q "$SENTINEL"; then
+    fail "[S15] sentinel leaked into human ATTN detail"
+else
+    ok
+fi
+
+# --- S16: grok file content must never reach output (stat-only probe) -------
+mock_all_green
+GROKSENT="$FIXROOT/grok-sentinel.json"
+printf '{"apiKey": "%s"}' "$SENTINEL" > "$GROKSENT"
+run_auth --json --pi-settings "$PISET" --grok-auth-file "$GROKSENT"
+assert_seat grok DEGRADED S16
+if printf '%s' "$RUN_OUT" | grep -q "$SENTINEL"; then
+    fail "[S16] grok credentials file content leaked into output"
+else
+    ok
+fi
+
+# --- S17: non-object legal JSON -> ATTN, run survives -----------------------
+mock_all_green
+mk_mock claude "echo '[]'"
+run_auth "${STD_FLAGS[@]}"
+assert_exit 1 S17
+assert_seat claude ATTN S17
+assert_seat codex OK S17
+mock_all_green
+mk_mock pi "echo 'null'"
+run_auth "${STD_FLAGS[@]}"
+assert_exit 1 S17b
+assert_seat "pi[mockprov]" ATTN S17b
+
+# --- S18: detail quote respects the UTF-8 byte budget (<=200B) --------------
+mock_all_green
+mk_mock claude "$PY -c \"print('word '*80)\""
+run_auth "${STD_FLAGS[@]}"
+assert_seat claude ATTN S18
+BYTES=$(printf '%s' "$RUN_OUT" | jget "len(next(s['detail'] for s in d['seats'] if s['seat']=='claude').split('output: ',1)[1].encode('utf-8'))")
+[[ "$BYTES" -le 200 ]] && ok || fail "[S18] ASCII quote bytes=$BYTES > 200"
+mock_all_green
+mk_mock claude "$PY -c \"print('汉'*300)\""
+run_auth "${STD_FLAGS[@]}"
+assert_seat claude ATTN S18b
+BYTES=$(printf '%s' "$RUN_OUT" | jget "len(next(s['detail'] for s in d['seats'] if s['seat']=='claude').split('output: ',1)[1].encode('utf-8'))")
+[[ "$BYTES" -le 200 ]] && ok || fail "[S18b] multibyte quote bytes=$BYTES > 200"
+
+# --- S19: --pi-providers strips names and OVERRIDES (seat count locked) -----
+mock_all_green
+run_auth "${STD_FLAGS[@]}" --pi-providers ' alpha , beta '
+assert_exit 0 S19
+assert_seat "pi[alpha]" OK S19
+assert_seat "pi[beta]" OK S19
+PIN=$(printf '%s' "$RUN_OUT" | jget "len([s for s in d['seats'] if s['seat'].startswith('pi')])")
+[[ "$PIN" == "2" ]] && ok || fail "[S19] pi seat count: want 2 got $PIN (override, not union)"
 
 echo "self-test: pass=$PASS fail=$FAIL"
 [[ "$FAIL" == "0" ]] || exit 1
