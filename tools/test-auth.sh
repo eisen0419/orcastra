@@ -39,6 +39,19 @@ run_auth() {
 
 jget() { "$PY" -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
+# Assert $2 does not appear in $1 either verbatim or after collapsing ALL
+# whitespace (catches per-character newline smuggling — R5 sol-S10).
+assert_no_secret() {
+    local hay=$1 secret=$2 label=$3
+    if printf '%s' "$hay" | grep -qF "$secret"; then
+        fail "[$label] secret '$secret' leaked verbatim"
+    elif printf '%s' "$hay" | tr -d '[:space:]' | grep -qF "$secret"; then
+        fail "[$label] secret '$secret' leaked whitespace-split"
+    else
+        ok
+    fi
+}
+
 assert_exit() {
     local want=$1 label=$2
     [[ "$RUN_EXIT" == "$want" ]] && ok || fail "[$label] exit: want=$want got=$RUN_EXIT; out: $RUN_OUT"
@@ -195,17 +208,9 @@ mk_mock claude "echo '{\"loggedIn\": false, \"token\": \"$SENTINEL\"}'"
 run_auth "${STD_FLAGS[@]}"
 assert_exit 1 S15
 assert_seat claude ATTN S15
-if printf '%s' "$RUN_OUT" | grep -q "$SENTINEL"; then
-    fail "[S15] sentinel leaked into --json ATTN detail"
-else
-    ok
-fi
+assert_no_secret "$RUN_OUT" "$SENTINEL" "S15/json"
 run_auth --pi-settings "$PISET" --grok-auth-file "$GROKAUTH"   # human output
-if printf '%s' "$RUN_OUT" | grep -q "$SENTINEL"; then
-    fail "[S15] sentinel leaked into human ATTN detail"
-else
-    ok
-fi
+assert_no_secret "$RUN_OUT" "$SENTINEL" "S15/human"
 
 # --- S16: grok file content must never reach output (stat-only probe) -------
 mock_all_green
@@ -213,11 +218,7 @@ GROKSENT="$FIXROOT/grok-sentinel.json"
 printf '{"apiKey": "%s"}' "$SENTINEL" > "$GROKSENT"
 run_auth --json --pi-settings "$PISET" --grok-auth-file "$GROKSENT"
 assert_seat grok DEGRADED S16
-if printf '%s' "$RUN_OUT" | grep -q "$SENTINEL"; then
-    fail "[S16] grok credentials file content leaked into output"
-else
-    ok
-fi
+assert_no_secret "$RUN_OUT" "$SENTINEL" "S16"
 
 # --- S17: non-object legal JSON -> ATTN, run survives -----------------------
 mock_all_green
@@ -273,26 +274,29 @@ redact_case() {  # redact_case <label> <mock-printf-arg> <secret>
     # --json side
     run_auth "${STD_FLAGS[@]}"
     assert_seat claude ATTN "$label"
-    if printf '%s' "$RUN_OUT" | grep -qF "$secret"; then
-        fail "[$label] secret '$secret' leaked into --json output"
-    else
-        ok
-    fi
-    local det
+    assert_no_secret "$RUN_OUT" "$secret" "$label/json"
+    # strongest form (R5 sol-S10): the ONLY legal detail is computed from the
+    # known mock output itself (len + sha256) and compared for full equality —
+    # string-level, so prefixes, suffixes, and extra lines all fail.
+    local expdet det
+    expdet=$(printf '%b\n' "$shape" | "$PY" -c "import sys,hashlib; raw=sys.stdin.buffer.read(); print(f'rc=0; output: {len(raw)}B sha256:{hashlib.sha256(raw).hexdigest()[:8]} (rerun the probe to view)')")
     det=$(printf '%s' "$RUN_OUT" | jget "next(s['detail'] for s in d['seats'] if s['seat']=='claude')")
-    # full-line anchor: any prefix, suffix, or smuggled fragment around a
-    # legal fingerprint must turn this red (R4 sol-S9)
-    if printf '%s' "$det" | grep -qE '^rc=-?[0-9]+; output: [0-9]+B sha256:[0-9a-f]{8} \(rerun the probe to view\)$'; then
+    if [[ "$det" == "$expdet" ]]; then
         ok
     else
-        fail "[$label] detail not exactly the fingerprint line: $det"
+        fail "[$label] detail != computed expectation; got: $det"
     fi
     # human side (R4 sol-S9: both report surfaces, not only --json)
     run_auth --pi-settings "$PISET" --grok-auth-file "$GROKAUTH"
-    if printf '%s' "$RUN_OUT" | grep -qF "$secret"; then
-        fail "[$label] secret '$secret' leaked into human output"
-    else
+    assert_no_secret "$RUN_OUT" "$secret" "$label/human"
+    # structure check (R5 sol-S10): 6 seats x (status line + stamp line) + 1
+    # summary line — smuggled continuation lines change the count
+    local hl
+    hl=$(printf '%s\n' "$RUN_OUT" | wc -l | tr -d ' ')
+    if [[ "$hl" == "13" ]]; then
         ok
+    else
+        fail "[$label] human output line count $hl != 13 (extra lines smuggled?)"
     fi
 }
 redact_case S20  '{"loggedIn": false, "password": "sh0rt!pw"}' 'sh0rt!pw'      # JSON field rule
