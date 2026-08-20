@@ -6,14 +6,19 @@ degraded file-existence probe where none exists) and report per seat:
   OK        - the logged-in shape matched
   ATTN      - binary present but the shape did not match (not logged in,
               network error, output drift, timeout - the tool does not guess
-              which; it quotes the raw output and points at the login command)
+              which; it reports a fingerprint of the raw output and points at
+              the login command; rerun the probe yourself to see the output)
   MISSING   - binary not on PATH (informational: you may not use that seat)
   DEGRADED  - grok only: credentials file exists (existence != validity)
 
 Contract (see the repo's auth-preflight spec):
   - read-only: never triggers a login flow, never writes to anything it checks
   - zero credential contact: never passes flags that emit credential values,
-    never reads a credential file's content (grok probe is a stat only)
+    never reads a credential file's content (grok probe is a stat only), and
+    never forwards a probe's raw output into the report - ATTN carries only
+    rc + byte count + sha256 prefix (fail-closed: redaction was tried and
+    adversarially bypassed three review rounds running; no forwarding means
+    no bypass)
   - stdlib only; per-seat probes are bounded by a timeout and run in parallel
 
 Honesty note: every OK predicate is a *logged-in* shape match, verified on a
@@ -26,6 +31,7 @@ Exit codes: 0 = every installed seat OK/DEGRADED, 1 = ATTN present,
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -35,7 +41,6 @@ import sys
 
 STATUS_ORDER = ("OK", "DEGRADED", "ATTN", "MISSING")
 USAGE_EXIT_CODE = 64
-DETAIL_QUOTE_LIMIT = 200
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -45,49 +50,19 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # >=24-char opaque run are replaced. Over-redaction is acceptable; leaking a
 # credential into a report is not. Human and --json output share this result.
 
-REDACTED = "[redacted]"
-_SENSITIVE_WORDS = r"(?:api[-_]?)?(?:token|key|secret|password|credential|authorization)s?"
-# JSON-quoted field: "..token..": <scalar>
-SENSITIVE_FIELD_RE = re.compile(
-    r'(?i)("[^"]*' + _SENSITIVE_WORDS + r'[^"]*"'
-    r'\s*:\s*)("(?:[^"\\]|\\.)*"|[^,}\]\s]+)')
-# bare field: token: value / token=value (outside JSON quoting)
-BARE_FIELD_RE = re.compile(
-    r"(?i)\b(" + _SENSITIVE_WORDS + r"\b\s*[:=]\s*)\S+")
-# bearer/authorization: swallow the full credential token, not just the word
-BEARER_RE = re.compile(
-    r"(?i)\b(bearer\s+|authorization\b[ =:]+(?:bearer\s+)?)\S+")
-# opaque run: includes base64 charset (/+=); lookarounds instead of \b, which
-# misbehaves next to non-word chars like / + =
-OPAQUE_RUN_RE = re.compile(
-    r"(?<![A-Za-z0-9_.\-/+=])[A-Za-z0-9_.\-/+=]{24,}(?![A-Za-z0-9_.\-/+=])")
-
-
 def strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
-def redact(text):
-    # ANSI is stripped FIRST: control codes could otherwise split a sensitive
-    # key or the word Bearer so no rule matches, then be stripped later,
-    # restoring the credential as plain text (R2 sol-S4).
-    text = strip_ansi(text)
-    text = SENSITIVE_FIELD_RE.sub(lambda m: m.group(1) + '"' + REDACTED + '"', text)
-    # BEARER before BARE: "Authorization: Bearer x" must be swallowed whole,
-    # or the bare-field rule eats the word Bearer as the value and the real
-    # credential survives.
-    text = BEARER_RE.sub(lambda m: m.group(1) + REDACTED, text)
-    text = BARE_FIELD_RE.sub(lambda m: m.group(1) + REDACTED, text)
-    return OPAQUE_RUN_RE.sub(REDACTED, text)
-
-
-def quote_output(text):
-    """Redact (ANSI-stripped inside), flatten, truncate to a UTF-8 byte budget."""
-    flat = " ".join(redact(text).split())
-    raw = flat.encode("utf-8")
-    if len(raw) > DETAIL_QUOTE_LIMIT:
-        return raw[: DETAIL_QUOTE_LIMIT - 3].decode("utf-8", "ignore") + "..."
-    return flat
+def safe_digest(text):
+    """Fingerprint of raw probe output. The raw text itself NEVER enters the
+    report: regex redaction was bypassed in three consecutive adversarial
+    review rounds (ANSI splits, quoted Authorization values, compound field
+    names, base64 charsets), so the fail-closed answer is zero forwarding.
+    Rerun the probe command yourself to see the output."""
+    raw = text.encode("utf-8", "replace")
+    return (f"{len(raw)}B sha256:{hashlib.sha256(raw).hexdigest()[:8]}"
+            " (rerun the probe to view)")
 
 
 def run_probe(argv, timeout):
@@ -211,7 +186,7 @@ def probe_simple_seat(seat, binary, args, predicate, hint, stamp, timeout):
     if matched:
         return (seat, "OK", "logged-in shape matched", hint, stamp)
     return (seat, "ATTN",
-            f"rc={rc}; output: {quote_output(out)}", hint, stamp)
+            f"rc={rc}; output: {safe_digest(out)}", hint, stamp)
 
 
 def pi_provider_set(cli_providers, settings_path):
@@ -249,7 +224,7 @@ def probe_pi_seat(cli_providers, settings_path, timeout):
         elif ok_pi(rc, out):
             results.append((seat, "OK", "logged-in shape matched", hint, PI_STAMP))
         else:
-            results.append((seat, "ATTN", f"rc={rc}; output: {quote_output(out)}",
+            results.append((seat, "ATTN", f"rc={rc}; output: {safe_digest(out)}",
                             hint, PI_STAMP))
     return results
 

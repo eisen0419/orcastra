@@ -232,19 +232,22 @@ run_auth "${STD_FLAGS[@]}"
 assert_exit 1 S17b
 assert_seat "pi[mockprov]" ATTN S17b
 
-# --- S18: detail quote respects the UTF-8 byte budget (<=200B) --------------
+# --- S18: ATTN detail is the whitelisted fingerprint shape ------------------
 mock_all_green
 mk_mock claude "$PY -c \"print('word '*80)\""
 run_auth "${STD_FLAGS[@]}"
 assert_seat claude ATTN S18
-BYTES=$(printf '%s' "$RUN_OUT" | jget "len(next(s['detail'] for s in d['seats'] if s['seat']=='claude').split('output: ',1)[1].encode('utf-8'))")
-[[ "$BYTES" -le 200 ]] && ok || fail "[S18] ASCII quote bytes=$BYTES > 200"
-mock_all_green
-mk_mock claude "$PY -c \"print('汉'*300)\""
-run_auth "${STD_FLAGS[@]}"
-assert_seat claude ATTN S18b
-BYTES=$(printf '%s' "$RUN_OUT" | jget "len(next(s['detail'] for s in d['seats'] if s['seat']=='claude').split('output: ',1)[1].encode('utf-8'))")
-[[ "$BYTES" -le 200 ]] && ok || fail "[S18b] multibyte quote bytes=$BYTES > 200"
+DET=$(printf '%s' "$RUN_OUT" | jget "next(s['detail'] for s in d['seats'] if s['seat']=='claude')")
+if printf '%s' "$DET" | grep -qE '^rc=0; output: [0-9]+B sha256:[0-9a-f]{8}'; then
+    ok
+else
+    fail "[S18] detail not the fingerprint shape: $DET"
+fi
+if printf '%s' "$RUN_OUT" | grep -q 'word'; then
+    fail "[S18] raw probe output forwarded into report"
+else
+    ok
+fi
 
 # --- S19: --pi-providers strips names and OVERRIDES (seat count locked) -----
 mock_all_green
@@ -255,10 +258,10 @@ assert_seat "pi[beta]" OK S19
 PIN=$(printf '%s' "$RUN_OUT" | jget "len([s for s in d['seats'] if s['seat'].startswith('pi')])")
 [[ "$PIN" == "2" ]] && ok || fail "[S19] pi seat count: want 2 got $PIN (override, not union)"
 
-# --- S20-S23: per-rule redaction sentinels (mutually non-overlapping) -------
-# Each secret is short and oddly-charactered so no OTHER rule can cover for a
-# deleted one (R2 sol-S5): deleting any single redaction rule must turn
-# exactly its scenario red.
+# --- S20-S26: zero-forwarding sentinels across adversarial shapes -----------
+# Every shape that beat the (now removed) redaction layer across review
+# rounds R2/R3. Under zero forwarding they must ALL stay out of the report;
+# any regression back to forwarding raw output turns these red.
 redact_case() {  # redact_case <label> <mock-printf-arg> <secret>
     local label=$1 shape=$2 secret=$3
     mock_all_green
@@ -273,6 +276,13 @@ redact_case() {  # redact_case <label> <mock-printf-arg> <secret>
         fail "[$label] secret '$secret' leaked into output"
     else
         ok
+    fi
+    local det
+    det=$(printf '%s' "$RUN_OUT" | jget "next(s['detail'] for s in d['seats'] if s['seat']=='claude')")
+    if printf '%s' "$det" | grep -qE '^rc=[0-9-]+; output: [0-9]+B sha256:[0-9a-f]{8}'; then
+        ok
+    else
+        fail "[$label] detail not the fingerprint shape: $det"
     fi
 }
 redact_case S20  '{"loggedIn": false, "password": "sh0rt!pw"}' 'sh0rt!pw'      # JSON field rule

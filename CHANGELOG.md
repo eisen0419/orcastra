@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seats (claude / codex / pi / opencode / cursor / grok). Runs each CLI's
   official headless status command (grok: degraded existence-only probe),
   reports OK / ATTN / MISSING / DEGRADED with the login command to run, and
-  never touches credentials. `--roles` limits seats to a roles config and
+  never touches credentials. ATTN carries only a fingerprint of the probe
+  output (rc + byte count + sha256 prefix) — raw CLI output is never
+  forwarded into the report. `--roles` limits seats to a roles config and
   escalates required-but-missing seats; `--json` for scripting.
 - `tools/test-auth.sh` — self-test against PATH-injected mock CLIs
   (33 assertions, incl. zero-credential argv checks).
