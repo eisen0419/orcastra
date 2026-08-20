@@ -289,7 +289,11 @@ redact_case S20  '{"loggedIn": false, "password": "sh0rt!pw"}' 'sh0rt!pw'      #
 redact_case S20b 'token: bare!val1'                            'bare!val1'     # bare field rule
 redact_case S21  'Bearer tok3n!val'                            'tok3n!val'     # bearer rule
 redact_case S22  'opaque ABCDE/FGHIJ+KLMNO=PQRSTUVW here'      'ABCDE/FGHIJ+KLMNO=PQRSTUVW'  # opaque incl. base64 charset
-redact_case S23  '{"to\x1b[31mken": "sp1it!val"}'             'sp1it!val'     # ANSI-split key (strip-before-redact order)
+redact_case S23  '{"to\x1b[31mken": "sp1it!val"}'             'sp1it!val'     # ANSI-split key (R2)
+redact_case S24  'Authorization: "Bearer quo!ted1"'            'quo!ted1'      # quoted Authorization value (R3 sol-S6)
+redact_case S25  '{"to\x1b[?25lken": "dec!csi1"}'              'dec!csi1'      # DEC private-mode CSI split (R3 sol-S7)
+redact_case S25b '{"to\x1b[38:5:31mken": "col!csi1"}'          'col!csi1'      # colon-form SGR split (R3 sol-S7)
+redact_case S26  'access_token: comp!nd1'                      'comp!nd1'      # compound bare field name (R3 sol-S8)
 
 echo "self-test: pass=$PASS fail=$FAIL"
 [[ "$FAIL" == "0" ]] || exit 1
