@@ -255,5 +255,31 @@ assert_seat "pi[beta]" OK S19
 PIN=$(printf '%s' "$RUN_OUT" | jget "len([s for s in d['seats'] if s['seat'].startswith('pi')])")
 [[ "$PIN" == "2" ]] && ok || fail "[S19] pi seat count: want 2 got $PIN (override, not union)"
 
+# --- S20-S23: per-rule redaction sentinels (mutually non-overlapping) -------
+# Each secret is short and oddly-charactered so no OTHER rule can cover for a
+# deleted one (R2 sol-S5): deleting any single redaction rule must turn
+# exactly its scenario red.
+redact_case() {  # redact_case <label> <mock-printf-arg> <secret>
+    local label=$1 shape=$2 secret=$3
+    mock_all_green
+    { echo '#!/bin/bash'
+      echo 'PATH=/usr/bin:/bin'
+      echo "printf '%b\n' '$shape'"
+    } > "$FIXBIN/claude"
+    chmod +x "$FIXBIN/claude"
+    run_auth "${STD_FLAGS[@]}"
+    assert_seat claude ATTN "$label"
+    if printf '%s' "$RUN_OUT" | grep -qF "$secret"; then
+        fail "[$label] secret '$secret' leaked into output"
+    else
+        ok
+    fi
+}
+redact_case S20  '{"loggedIn": false, "password": "sh0rt!pw"}' 'sh0rt!pw'      # JSON field rule
+redact_case S20b 'token: bare!val1'                            'bare!val1'     # bare field rule
+redact_case S21  'Bearer tok3n!val'                            'tok3n!val'     # bearer rule
+redact_case S22  'opaque ABCDE/FGHIJ+KLMNO=PQRSTUVW here'      'ABCDE/FGHIJ+KLMNO=PQRSTUVW'  # opaque incl. base64 charset
+redact_case S23  '{"to\x1b[31mken": "sp1it!val"}'             'sp1it!val'     # ANSI-split key (strip-before-redact order)
+
 echo "self-test: pass=$PASS fail=$FAIL"
 [[ "$FAIL" == "0" ]] || exit 1

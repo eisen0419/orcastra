@@ -46,26 +46,44 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # credential into a report is not. Human and --json output share this result.
 
 REDACTED = "[redacted]"
+_SENSITIVE_WORDS = r"(?:api[-_]?)?(?:token|key|secret|password|credential|authorization)s?"
+# JSON-quoted field: "..token..": <scalar>
 SENSITIVE_FIELD_RE = re.compile(
-    r'(?i)("[^"]*(?:token|key|secret|password|credential|authorization)[^"]*"'
+    r'(?i)("[^"]*' + _SENSITIVE_WORDS + r'[^"]*"'
     r'\s*:\s*)("(?:[^"\\]|\\.)*"|[^,}\]\s]+)')
-BEARER_RE = re.compile(r"(?i)\b(bearer|authorization:?)([ =:]+)\S+")
-OPAQUE_RUN_RE = re.compile(r"\b[A-Za-z0-9_.\-]{24,}\b")
-
-
-def redact(text):
-    text = SENSITIVE_FIELD_RE.sub(lambda m: m.group(1) + '"' + REDACTED + '"', text)
-    text = BEARER_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
-    return OPAQUE_RUN_RE.sub(REDACTED, text)
+# bare field: token: value / token=value (outside JSON quoting)
+BARE_FIELD_RE = re.compile(
+    r"(?i)\b(" + _SENSITIVE_WORDS + r"\b\s*[:=]\s*)\S+")
+# bearer/authorization: swallow the full credential token, not just the word
+BEARER_RE = re.compile(
+    r"(?i)\b(bearer\s+|authorization\b[ =:]+(?:bearer\s+)?)\S+")
+# opaque run: includes base64 charset (/+=); lookarounds instead of \b, which
+# misbehaves next to non-word chars like / + =
+OPAQUE_RUN_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-/+=])[A-Za-z0-9_.\-/+=]{24,}(?![A-Za-z0-9_.\-/+=])")
 
 
 def strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
+def redact(text):
+    # ANSI is stripped FIRST: control codes could otherwise split a sensitive
+    # key or the word Bearer so no rule matches, then be stripped later,
+    # restoring the credential as plain text (R2 sol-S4).
+    text = strip_ansi(text)
+    text = SENSITIVE_FIELD_RE.sub(lambda m: m.group(1) + '"' + REDACTED + '"', text)
+    # BEARER before BARE: "Authorization: Bearer x" must be swallowed whole,
+    # or the bare-field rule eats the word Bearer as the value and the real
+    # credential survives.
+    text = BEARER_RE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = BARE_FIELD_RE.sub(lambda m: m.group(1) + REDACTED, text)
+    return OPAQUE_RUN_RE.sub(REDACTED, text)
+
+
 def quote_output(text):
-    """Redact, flatten, and truncate to a UTF-8 byte budget (ellipsis included)."""
-    flat = " ".join(strip_ansi(redact(text)).split())
+    """Redact (ANSI-stripped inside), flatten, truncate to a UTF-8 byte budget."""
+    flat = " ".join(redact(text).split())
     raw = flat.encode("utf-8")
     if len(raw) > DETAIL_QUOTE_LIMIT:
         return raw[: DETAIL_QUOTE_LIMIT - 3].decode("utf-8", "ignore") + "..."
