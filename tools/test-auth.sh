@@ -270,19 +270,29 @@ redact_case() {  # redact_case <label> <mock-printf-arg> <secret>
       echo "printf '%b\n' '$shape'"
     } > "$FIXBIN/claude"
     chmod +x "$FIXBIN/claude"
+    # --json side
     run_auth "${STD_FLAGS[@]}"
     assert_seat claude ATTN "$label"
     if printf '%s' "$RUN_OUT" | grep -qF "$secret"; then
-        fail "[$label] secret '$secret' leaked into output"
+        fail "[$label] secret '$secret' leaked into --json output"
     else
         ok
     fi
     local det
     det=$(printf '%s' "$RUN_OUT" | jget "next(s['detail'] for s in d['seats'] if s['seat']=='claude')")
-    if printf '%s' "$det" | grep -qE '^rc=[0-9-]+; output: [0-9]+B sha256:[0-9a-f]{8}'; then
+    # full-line anchor: any prefix, suffix, or smuggled fragment around a
+    # legal fingerprint must turn this red (R4 sol-S9)
+    if printf '%s' "$det" | grep -qE '^rc=-?[0-9]+; output: [0-9]+B sha256:[0-9a-f]{8} \(rerun the probe to view\)$'; then
         ok
     else
-        fail "[$label] detail not the fingerprint shape: $det"
+        fail "[$label] detail not exactly the fingerprint line: $det"
+    fi
+    # human side (R4 sol-S9: both report surfaces, not only --json)
+    run_auth --pi-settings "$PISET" --grok-auth-file "$GROKAUTH"
+    if printf '%s' "$RUN_OUT" | grep -qF "$secret"; then
+        fail "[$label] secret '$secret' leaked into human output"
+    else
+        ok
     fi
 }
 redact_case S20  '{"loggedIn": false, "password": "sh0rt!pw"}' 'sh0rt!pw'      # JSON field rule
